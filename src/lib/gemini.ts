@@ -1,7 +1,7 @@
-import { GoogleGenerativeAI, SchemaType } from '@google/generative-ai';
+import { GoogleGenAI, Type } from '@google/genai';
 import { createServerSupabaseClient } from './supabaseServer';
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
 
 // Define system instructions for safety, language, and booking
 const SYSTEM_INSTRUCTION = `
@@ -26,16 +26,17 @@ Your goals:
    - Present the search results to the patient. Tell them they can book an appointment with them directly in the chat or on the Find Doctors page.
 `;
 
-const searchDoctorsTool: any = {
+// Tool definition for doctor search
+const searchDoctorsTool = {
   functionDeclarations: [
     {
       name: 'search_doctors_by_specialization',
       description: 'Search the database of registered hospital doctors by their medical specialization.',
       parameters: {
-        type: SchemaType.OBJECT,
+        type: Type.OBJECT,
         properties: {
           specialization: {
-            type: SchemaType.STRING,
+            type: Type.STRING,
             description: 'The medical specialization to search for, e.g. Cardiology, Dermatology, Pediatrics, General Medicine, Orthopedics, Neurology, Psychiatry, Gynecology.',
           },
         },
@@ -49,27 +50,28 @@ export async function generateAIResponse(
   message: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[]
 ) {
-  const modelsToTry = ['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-flash-latest'];
+  const modelsToTry = ['gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-2.5-flash-lite'];
   let lastError: any = null;
 
   for (const modelName of modelsToTry) {
     try {
-      const model = genAI.getGenerativeModel({
+      // Create a chat session with history using the new @google/genai SDK
+      const chat = ai.chats.create({
         model: modelName,
-        systemInstruction: SYSTEM_INSTRUCTION,
-        tools: [searchDoctorsTool],
-      });
-
-      const chat = model.startChat({
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION,
+          tools: [searchDoctorsTool],
+        },
         history: history.map(h => ({
           role: h.role,
-          parts: h.parts
+          parts: h.parts,
         })),
       });
 
-      let result = await chat.sendMessage(message);
-      let responseText = result.response.text();
-      let functionCalls = result.response.functionCalls();
+      // Send the user's message
+      let result = await chat.sendMessage({ message });
+      let responseText = result.text || '';
+      let functionCalls = result.functionCalls;
       let doctorsResult: any[] = [];
 
       // Check if the model wants to call a function/tool
@@ -91,16 +93,17 @@ export async function generateAIResponse(
             doctorsResult = doctors || [];
           }
 
-          // Send the function response back to Gemini
-          const functionResponsePart = {
-            functionResponse: {
-              name: 'search_doctors_by_specialization',
-              response: { doctors: doctorsResult }
-            }
-          };
+          // Send the function response back to the model
+          const followUpResult = await chat.sendMessage({
+            message: [{
+              functionResponse: {
+                name: 'search_doctors_by_specialization',
+                response: { doctors: doctorsResult }
+              }
+            }]
+          });
 
-          const followUpResult = await chat.sendMessage([functionResponsePart]);
-          responseText = followUpResult.response.text();
+          responseText = followUpResult.text || '';
         }
       }
 
