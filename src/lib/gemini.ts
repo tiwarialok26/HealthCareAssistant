@@ -55,8 +55,8 @@ export async function generateAIResponse(
   message: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[]
 ) {
-  // Use a single supported free-tier model
-  const modelName = 'gemini-2.0-flash';
+  // Use a single supported free-tier model with active quota
+  const modelName = 'gemini-3.5-flash-lite';
   let lastError: any = null;
   const maxRetries = 3;
   
