@@ -215,15 +215,10 @@ export default function AIAssistantPage() {
         return;
       }
 
-      // Update current session id
+      // Update current session id locally without a network request
       if (!currentSessionId) {
         setCurrentSessionId(data.sessionId);
-        // Refresh session list
-        const sessRes = await fetch('/api/chat');
-        if (sessRes.ok) {
-          const sessData = await sessRes.json();
-          setSessions(sessData);
-        }
+        setSessions(prev => [{ id: data.sessionId, created_at: new Date().toISOString() }, ...prev]);
       }
 
       // Add AI response

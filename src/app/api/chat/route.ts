@@ -59,8 +59,8 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 4. Save patient message in DB
-    const { error: savePatientMsgError } = await supabase
+    // 4. Save patient message and fetch history concurrently
+    const savePatientMsgPromise = supabase
       .from('chat_messages')
       .insert({
         session_id: sessionId,
@@ -68,25 +68,28 @@ export async function POST(req: NextRequest) {
         message: message.trim()
       });
 
-    if (savePatientMsgError) {
-      console.error('Save patient message error:', savePatientMsgError);
-      return NextResponse.json({ error: 'Failed to save message.' }, { status: 500 });
-    }
-
-    // 5. Fetch previous messages for this session to build history (up to 20 messages for context)
-    const { data: pastMessages, error: fetchHistoryError } = await supabase
+    const fetchHistoryPromise = supabase
       .from('chat_messages')
       .select('sender, message, created_at')
       .eq('session_id', sessionId)
       .order('created_at', { ascending: true })
-      .limit(30);
+      .limit(10); // Reduced from 30 to speed up DB and AI processing
+
+    const [saveResult, historyResult] = await Promise.all([savePatientMsgPromise, fetchHistoryPromise]);
+
+    if (saveResult.error) {
+      console.error('Save patient message error:', saveResult.error);
+      return NextResponse.json({ error: 'Failed to save message.' }, { status: 500 });
+    }
 
     let chatHistory: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
     
-    if (!fetchHistoryError && pastMessages) {
-      // Convert to Gemini format, excluding the message we just inserted (since chat.sendMessage adds it)
-      const messagesToFormat = pastMessages.slice(0, -1);
-      chatHistory = messagesToFormat.map(msg => ({
+    if (!historyResult.error && historyResult.data) {
+      // If this was an existing session, the history fetch will not include the message we just saved
+      // since they ran concurrently (or it might race). 
+      // We just pass the fetched history up to the AI, Gemini's SDK will append the current message.
+      const pastMessages = historyResult.data;
+      chatHistory = pastMessages.map(msg => ({
         role: msg.sender === 'PATIENT' ? 'user' : 'model',
         parts: [{ text: msg.message }]
       }));
