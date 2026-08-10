@@ -95,6 +95,13 @@ export async function POST(req: NextRequest) {
     // 6. Generate response from Gemini (with tool calling)
     const aiResult = await generateAIResponse(message, chatHistory);
 
+    if (aiResult.isRateLimit) {
+      return NextResponse.json({ 
+        error: aiResult.text,
+        isRateLimit: true
+      }, { status: 429 });
+    }
+
     // 7. Save AI message in DB
     const { error: saveAiMsgError } = await supabase
       .from('chat_messages')

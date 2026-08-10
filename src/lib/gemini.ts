@@ -55,105 +55,131 @@ export async function generateAIResponse(
   message: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[]
 ) {
-  // Use currently available model names (updated Aug 2026)
-  const modelsToTry = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
+  // Use a single supported free-tier model
+  const modelName = 'gemini-2.0-flash';
   let lastError: any = null;
+  const maxRetries = 3;
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const timestamp = new Date().toISOString();
+      console.log(`[${timestamp}] Gemini API Request: model=${modelName}, attempt=${attempt + 1}, reason='User chat message'`);
 
-  for (const modelName of modelsToTry) {
-    // Try each model up to 2 times (with a delay on rate-limit)
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        // Create a chat session with history
-        const chat = ai.chats.create({
-          model: modelName,
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            tools: [searchDoctorsTool],
-          },
-          history: history.map(h => ({
-            role: h.role,
-            parts: h.parts,
-          })),
-        });
+      // Create a chat session with history
+      const chat = ai.chats.create({
+        model: modelName,
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION,
+          tools: [searchDoctorsTool],
+        },
+        history: history.map(h => ({
+          role: h.role,
+          parts: h.parts,
+        })),
+      });
 
-        // Send the user's message
-        let result = await chat.sendMessage({ message });
-        let responseText = result.text || '';
-        let functionCalls = result.functionCalls;
-        let doctorsResult: any[] = [];
+      // Send the user's message
+      let result = await chat.sendMessage({ message });
+      let responseText = result.text || '';
+      let functionCalls = result.functionCalls;
+      let doctorsResult: any[] = [];
 
-        // Check if the model wants to call a function/tool
-        if (functionCalls && functionCalls.length > 0) {
-          const call = functionCalls[0];
-          if (call.name === 'search_doctors_by_specialization') {
-            const args = call.args as { specialization: string };
-            
-            // Execute the database search
-            const supabase = await createServerSupabaseClient();
-            const { data: doctors, error } = await supabase
-              .from('doctor_profiles')
-              .select('id, full_name, specialization, qualification, consultation_fee, hospital_name, verification_status, profile_photo, experience_years')
-              .ilike('specialization', `%${args.specialization}%`);
+      // Check if the model wants to call a function/tool
+      if (functionCalls && functionCalls.length > 0) {
+        const call = functionCalls[0];
+        if (call.name === 'search_doctors_by_specialization') {
+          const args = call.args as { specialization: string };
+          
+          const supabase = await createServerSupabaseClient();
+          const { data: doctors, error } = await supabase
+            .from('doctor_profiles')
+            .select('id, full_name, specialization, qualification, consultation_fee, hospital_name, verification_status, profile_photo, experience_years')
+            .ilike('specialization', `%${args.specialization}%`);
 
-            if (error) {
-              console.error('Error fetching doctors for AI:', error);
-            } else {
-              doctorsResult = doctors || [];
-            }
-
-            // Send the function response back to the model
-            const followUpResult = await chat.sendMessage({
-              message: [{
-                functionResponse: {
-                  name: 'search_doctors_by_specialization',
-                  response: { doctors: doctorsResult }
-                }
-              }]
-            });
-
-            responseText = followUpResult.text || '';
+          if (error) {
+            console.error('Error fetching doctors for AI:', error);
+          } else {
+            doctorsResult = doctors || [];
           }
+
+          const followUpTimestamp = new Date().toISOString();
+          console.log(`[${followUpTimestamp}] Gemini API Request: model=${modelName}, attempt=${attempt + 1}, reason='Function response callback'`);
+
+          // Send the function response back to the model
+          const followUpResult = await chat.sendMessage({
+            message: [{
+              functionResponse: {
+                name: 'search_doctors_by_specialization',
+                response: { doctors: doctorsResult }
+              }
+            }]
+          });
+
+          responseText = followUpResult.text || '';
         }
-
-        return {
-          text: responseText,
-          doctors: doctorsResult,
-        };
-      } catch (error: any) {
-        lastError = error;
-        const errorMessage = error?.message || String(error);
-        console.warn(`Gemini Model ${modelName} (attempt ${attempt + 1}) failed:`, errorMessage);
-
-        // If rate-limited (429), wait and retry once
-        if (errorMessage.includes('429') || errorMessage.includes('RESOURCE_EXHAUSTED')) {
-          if (attempt === 0) {
-            console.log(`Rate limited on ${modelName}, waiting 35 seconds before retry...`);
-            await delay(35000);
-            continue; // retry same model
-          }
-        }
-
-        // If model is not found/deprecated (404), skip to next model immediately
-        if (errorMessage.includes('404') || errorMessage.includes('NOT_FOUND')) {
-          break; // try next model
-        }
-
-        break; // other errors, try next model
       }
+
+      return {
+        text: responseText,
+        doctors: doctorsResult,
+        isRateLimit: false,
+        rawError: null
+      };
+    } catch (error: any) {
+      lastError = error;
+      const errorMessage = error?.message || String(error);
+      const isRateLimit = errorMessage.includes('429') || errorMessage.includes('RESOURCE_EXHAUSTED') || errorMessage.includes('quota');
+      
+      console.log(`\n=== GEMINI RESPONSE ===`);
+      console.log(`status: ${error?.status || error?.code || 'UNKNOWN'}`);
+      console.log(`error: ${errorMessage}`);
+      
+      // Attempt to extract detailed Google RPC quota information if available
+      let quotaInfo = 'No specific quota details found in error object';
+      let retryDelay = 'None provided';
+      
+      if (error?.details && Array.isArray(error.details)) {
+        console.log(`details: ${JSON.stringify(error.details, null, 2)}`);
+        
+        const quotaFailure = error.details.find((d: any) => d['@type']?.includes('QuotaFailure'));
+        if (quotaFailure && quotaFailure.violations) {
+           quotaInfo = JSON.stringify(quotaFailure.violations);
+        }
+        
+        const retryInfo = error.details.find((d: any) => d['@type']?.includes('RetryInfo'));
+        if (retryInfo) {
+           retryDelay = retryInfo.retryDelay;
+        }
+      }
+
+      console.log(`quota: ${quotaInfo}`);
+      console.log(`retryDelay: ${retryDelay}`);
+      console.log(`=======================\n`);
+
+      if (isRateLimit && attempt < maxRetries) {
+        // Exponential backoff: 1s -> 2s -> 4s
+        const backoffMs = Math.pow(2, attempt) * 1000;
+        console.log(`Rate limited (429). Retrying in ${backoffMs}ms...`);
+        await delay(backoffMs);
+        continue;
+      }
+      
+      break; // Stop retrying on non-429 errors or if max retries reached
     }
   }
 
-  // If all models failed, return a descriptive error
+  // If we reach here, all retries failed
   const errorMsg = lastError?.message || '';
   const isRateLimit = errorMsg.includes('429') || errorMsg.includes('RESOURCE_EXHAUSTED') || errorMsg.includes('quota');
-
-  console.error('All Gemini models failed. Last error:', lastError);
   
+  console.error(`\n[${new Date().toISOString()}] Gemini API final failure. Rate limited: ${isRateLimit}`);
+  
+  // Return the EXACT error message to the frontend for debugging purposes
   return {
-    text: isRateLimit
-      ? 'The AI assistant has reached its usage limit temporarily. Please wait a few minutes and try again. If you are experiencing a medical emergency, please call emergency services (911 or 108) immediately.'
-      : 'Sorry, the AI health assistant is temporarily unavailable. If you are experiencing a medical emergency, please call your local emergency services (e.g. 911 or 108) immediately.',
-    doctors: []
+    text: `DEBUG API ERROR: ${errorMsg}`,
+    doctors: [],
+    isRateLimit: true, // Force true to trigger the 429 handler in route.ts, or we can let route.ts pass it through
+    rawError: errorMsg
   };
 }
 

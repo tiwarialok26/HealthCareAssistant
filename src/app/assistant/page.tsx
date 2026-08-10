@@ -171,9 +171,15 @@ export default function AIAssistantPage() {
     setInputText('');
   };
 
+  const isProcessingRef = useRef(false);
+
   const handleSendMessage = async (textToSend?: string) => {
     const text = textToSend || inputText;
-    if (!text.trim() || sending) return;
+    if (!text.trim() || sending || isProcessingRef.current) return;
+
+    // Strict lock to prevent double-firing before React state 'sending' updates
+    isProcessingRef.current = true;
+    setSending(true);
 
     // Stop speaking if currently speaking
     if (window.speechSynthesis) {
@@ -184,7 +190,6 @@ export default function AIAssistantPage() {
     const patientMsg: Message = { sender: 'PATIENT', message: text };
     setMessages(prev => [...prev, patientMsg]);
     setInputText('');
-    setSending(true);
     setStatusText('Processing...');
 
     try {
@@ -200,8 +205,12 @@ export default function AIAssistantPage() {
       const data = await response.json();
 
       if (!response.ok) {
-        setMessages(prev => [...prev, { sender: 'AI', message: data.error || 'Failed to get response.' }]);
+        setMessages(prev => [...prev, { 
+          sender: 'AI', 
+          message: data.error || (response.status === 429 ? 'Please wait a moment before sending another message.' : 'Failed to get response.') 
+        }]);
         setSending(false);
+        isProcessingRef.current = false;
         setStatusText('');
         return;
       }
@@ -233,6 +242,7 @@ export default function AIAssistantPage() {
       setMessages(prev => [...prev, { sender: 'AI', message: 'Unable to communicate with AI Assistant.' }]);
     } finally {
       setSending(false);
+      isProcessingRef.current = false;
       if (!isSpeaking) {
         setStatusText('');
       }
