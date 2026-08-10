@@ -46,81 +46,114 @@ const searchDoctorsTool = {
   ],
 };
 
+// Helper to delay execution
+function delay(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export async function generateAIResponse(
   message: string,
   history: { role: 'user' | 'model'; parts: { text: string }[] }[]
 ) {
-  const modelsToTry = ['gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-2.5-flash-lite'];
+  // Use currently available model names (updated Aug 2026)
+  const modelsToTry = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
   let lastError: any = null;
 
   for (const modelName of modelsToTry) {
-    try {
-      // Create a chat session with history using the new @google/genai SDK
-      const chat = ai.chats.create({
-        model: modelName,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          tools: [searchDoctorsTool],
-        },
-        history: history.map(h => ({
-          role: h.role,
-          parts: h.parts,
-        })),
-      });
+    // Try each model up to 2 times (with a delay on rate-limit)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        // Create a chat session with history
+        const chat = ai.chats.create({
+          model: modelName,
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            tools: [searchDoctorsTool],
+          },
+          history: history.map(h => ({
+            role: h.role,
+            parts: h.parts,
+          })),
+        });
 
-      // Send the user's message
-      let result = await chat.sendMessage({ message });
-      let responseText = result.text || '';
-      let functionCalls = result.functionCalls;
-      let doctorsResult: any[] = [];
+        // Send the user's message
+        let result = await chat.sendMessage({ message });
+        let responseText = result.text || '';
+        let functionCalls = result.functionCalls;
+        let doctorsResult: any[] = [];
 
-      // Check if the model wants to call a function/tool
-      if (functionCalls && functionCalls.length > 0) {
-        const call = functionCalls[0];
-        if (call.name === 'search_doctors_by_specialization') {
-          const args = call.args as { specialization: string };
-          
-          // Execute the database search
-          const supabase = await createServerSupabaseClient();
-          const { data: doctors, error } = await supabase
-            .from('doctor_profiles')
-            .select('id, full_name, specialization, qualification, consultation_fee, hospital_name, verification_status, profile_photo, experience_years')
-            .ilike('specialization', `%${args.specialization}%`);
+        // Check if the model wants to call a function/tool
+        if (functionCalls && functionCalls.length > 0) {
+          const call = functionCalls[0];
+          if (call.name === 'search_doctors_by_specialization') {
+            const args = call.args as { specialization: string };
+            
+            // Execute the database search
+            const supabase = await createServerSupabaseClient();
+            const { data: doctors, error } = await supabase
+              .from('doctor_profiles')
+              .select('id, full_name, specialization, qualification, consultation_fee, hospital_name, verification_status, profile_photo, experience_years')
+              .ilike('specialization', `%${args.specialization}%`);
 
-          if (error) {
-            console.error('Error fetching doctors for AI:', error);
-          } else {
-            doctorsResult = doctors || [];
+            if (error) {
+              console.error('Error fetching doctors for AI:', error);
+            } else {
+              doctorsResult = doctors || [];
+            }
+
+            // Send the function response back to the model
+            const followUpResult = await chat.sendMessage({
+              message: [{
+                functionResponse: {
+                  name: 'search_doctors_by_specialization',
+                  response: { doctors: doctorsResult }
+                }
+              }]
+            });
+
+            responseText = followUpResult.text || '';
           }
-
-          // Send the function response back to the model
-          const followUpResult = await chat.sendMessage({
-            message: [{
-              functionResponse: {
-                name: 'search_doctors_by_specialization',
-                response: { doctors: doctorsResult }
-              }
-            }]
-          });
-
-          responseText = followUpResult.text || '';
         }
-      }
 
-      return {
-        text: responseText,
-        doctors: doctorsResult, // Send structured list of doctors back to the frontend to render nice cards
-      };
-    } catch (error) {
-      console.warn(`Gemini Model ${modelName} failed, trying next... Error:`, error);
-      lastError = error;
+        return {
+          text: responseText,
+          doctors: doctorsResult,
+        };
+      } catch (error: any) {
+        lastError = error;
+        const errorMessage = error?.message || String(error);
+        console.warn(`Gemini Model ${modelName} (attempt ${attempt + 1}) failed:`, errorMessage);
+
+        // If rate-limited (429), wait and retry once
+        if (errorMessage.includes('429') || errorMessage.includes('RESOURCE_EXHAUSTED')) {
+          if (attempt === 0) {
+            console.log(`Rate limited on ${modelName}, waiting 35 seconds before retry...`);
+            await delay(35000);
+            continue; // retry same model
+          }
+        }
+
+        // If model is not found/deprecated (404), skip to next model immediately
+        if (errorMessage.includes('404') || errorMessage.includes('NOT_FOUND')) {
+          break; // try next model
+        }
+
+        break; // other errors, try next model
+      }
     }
   }
 
-  // If all models failed:
+  // If all models failed, return a descriptive error
+  const errorMsg = lastError?.message || '';
+  const isRateLimit = errorMsg.includes('429') || errorMsg.includes('RESOURCE_EXHAUSTED') || errorMsg.includes('quota');
+
   console.error('All Gemini models failed. Last error:', lastError);
+  
   return {
-    text: 'Sorry, the AI health assistant is temporarily unavailable. If you are experiencing a medical emergency, please call your local emergency services (e.g. 911 or 108) immediately.',
+    text: isRateLimit
+      ? 'The AI assistant has reached its usage limit temporarily. Please wait a few minutes and try again. If you are experiencing a medical emergency, please call emergency services (911 or 108) immediately.'
+      : 'Sorry, the AI health assistant is temporarily unavailable. If you are experiencing a medical emergency, please call your local emergency services (e.g. 911 or 108) immediately.',
     doctors: []
   };
 }
+
